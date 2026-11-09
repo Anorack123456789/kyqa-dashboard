@@ -1,7 +1,7 @@
-"""
-Módulo ETL, Entrenamiento del Árbol de Decisión y Motor Prescriptivo.
-Implementa la lógica analítica definida para el Parque Kyqa Mhuysqa.
-"""
+
+# Módulo ETL, Entrenamiento del Árbol de Decisión y Motor Prescriptivo.
+# Implementa la lógica analítica definida para el Parque Kyqa Mhuysqa.
+
 
 import os
 from typing import Dict, Any, Tuple
@@ -10,6 +10,9 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import requests
+import holidays
+from datetime import datetime, timedelta
 
 # Mapeo oficial de DAYOFWEEK en MySQL (1 = Domingo, 2 = Lunes, ..., 7 = Sábado)
 DIAS_SEMANA_MAP = {
@@ -27,73 +30,90 @@ DIAS_ORDENADOS = [
 ]
 
 
-def run_etl_pipeline(df_raw: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
+def run_etl_pipeline(df_raw, seed=42):
     """
-    Procesa los datos históricos de reservas, agrupa por fecha, clasifica los niveles
-    de demanda operativa e inyecta las variables exógenas de validación experimental.
-
-    Args:
-        df_raw (pd.DataFrame): Datos crudos extraídos de la tabla Reserva.
-        seed (int): Semilla aleatoria para reproducibilidad estadística.
-
-    Returns:
-        pd.DataFrame: Dataset transformado listo para el modelo y visualización.
+    Limpia los datos históricos y enriquece el modelo con el calendario
+    oficial de Colombia y datos meteorológicos reales de Facatativá.
     """
     df = df_raw.copy()
-    df["Fecha"] = pd.to_datetime(df["Fecha"]).dt.date
+    
+    # 1. Asegurar formato de fecha
+    df['Fecha'] = pd.to_datetime(df['Fecha'])
+    df['Fecha_dt'] = df['Fecha'] # Copia para gráficos
+    df = df[df['Fecha'].dt.year >= 2021].copy()
+    # 2. Ingeniería de Características: Días de la semana
+    df['dia_semana'] = ((df['Fecha'].dt.dayofweek + 1) % 7) + 1
+    df['nombre_dia'] = df['dia_semana'].map(DIAS_SEMANA_MAP)
+    
+    # 3. Integración Calendario Oficial (Festivos Colombia)
+    co_holidays = holidays.Colombia()
+    df['es_festivo'] = df['Fecha'].apply(lambda x: 1 if x in co_holidays else 0)
+    df['festivo_label'] = df['es_festivo'].map({0: 'Día Ordinario', 1: 'Festivo / Puente'})
 
-    # Consolidación diaria
-    df_historico = (
-        df.groupby("Fecha")
-        .agg({"volumen_real": "sum", "dia_semana": "first"})
-        .reset_index()
-    )
+    # 4. Integración API Meteorológica Real (Open-Meteo Histórico - Facatativá)
+    # Obtenemos los rangos de fechas del dataset para hacer una sola llamada masiva
+    min_date = df['Fecha'].min().strftime('%Y-%m-%d')
+    max_date = df['Fecha'].max().strftime('%Y-%m-%d')
+    
+    # Coordenadas aproximadas Parque Kyqa Mhuysqa / Facatativá
+    limite_api = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+    max_date_req = min(df['Fecha'].max().strftime('%Y-%m-%d'), limite_api)
 
-    # Transformación a Modelo de Clasificación (Rangos ajustados al tráfico diario real)
-    # Baja: 0-3 (Capacidad ociosa) | Media: 4-10 (Sostenible) | Alta: >11 (Pico operativo)
-    bins = [-1, 3, 10, float("inf")]
-    labels = ["Baja", "Media", "Alta"]
-    df_historico["categoria_demanda"] = pd.cut(
-        df_historico["volumen_real"], bins=bins, labels=labels
-    ).astype(str)
+    lat, lon = 4.81, -74.35
+    url_clima = f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lon}&start_date={min_date}&end_date={max_date_req}&daily=precipitation_sum&timezone=America%2FBogota"
 
-    # Inyección controlada de variables predictivas exógenas (Clima y Festivos)
-    np.random.seed(seed)
-    df_historico["es_festivo"] = np.random.choice(
-        [0, 1], size=len(df_historico), p=[0.9, 0.1]
-    )
-    df_historico["prob_lluvia"] = np.random.choice(
-        [0, 1], size=len(df_historico), p=[0.7, 0.3]
-    )
+    try:
+        response = requests.get(url_clima, timeout=10)
+        data = response.json()
+        
+        if 'daily' not in data:
+            print("Respuesta de la API:", data) # Imprime el error real si lo hay
+            raise ValueError("No se encontró el bloque 'daily'.")
+            
+        weather_df = pd.DataFrame({
+            'Fecha': pd.to_datetime(data['daily']['time']),
+            'precipitacion_mm': data['daily']['precipitation_sum']
+        })
+        
+        weather_df['prob_lluvia'] = weather_df['precipitacion_mm'].apply(lambda x: 1 if x > 3.0 else 0)
+        df = df.merge(weather_df[['Fecha', 'prob_lluvia']], on='Fecha', how='left')
+        
+        # A los días del futuro que no pasaron por la API, les asignamos clima seco por defecto
+        df['prob_lluvia'] = df['prob_lluvia'].fillna(0).astype(int)
+        
+    except Exception as e:
+        print(f"Error técnico de la API del clima: {e}")
+        np.random.seed(seed)
+        df['prob_lluvia'] = np.random.choice([0, 1], size=len(df), p=[0.65, 0.35])
 
-    # Etiquetas legibles para análisis y drill-down
-    df_historico["nombre_dia"] = df_historico["dia_semana"].map(DIAS_SEMANA_MAP)
-    df_historico["clima_label"] = df_historico["prob_lluvia"].map(
-        {0: "Tiempo Seco / Despejado", 1: "Alta Prob. de Lluvia"}
-    )
-    df_historico["festivo_label"] = df_historico["es_festivo"].map(
-        {0: "Día Ordinario", 1: "Festivo / Puente"}
-    )
-    df_historico["Fecha_dt"] = pd.to_datetime(df_historico["Fecha"])
-    df_historico["Mes"] = df_historico["Fecha_dt"].dt.strftime("%Y-%m")
+    df['clima_label'] = df['prob_lluvia'].map({0: 'Seco', 1: 'Lluvia'})
 
-    return df_historico
-
-
+    # 5. Segmentación de la Variable Objetivo (Categoría de Demanda)
+    condiciones = [
+        (df['volumen_real'] <= 3),
+        (df['volumen_real'] > 3) & (df['volumen_real'] <= 10),
+        (df['volumen_real'] > 10)
+    ]
+    etiquetas = ['Baja', 'Media', 'Alta']
+    df['categoria_demanda'] = np.select(condiciones, etiquetas, default='Baja')
+    print(df[['Fecha', 'es_festivo', 'prob_lluvia']].head(10))
+    return df
 def train_decision_tree(
     df_historico: pd.DataFrame, max_depth: int = 3, seed: int = 42
 ) -> Tuple[DecisionTreeClassifier, Dict[str, Any]]:
-    """
-    Entrena el modelo DecisionTreeClassifier y calcula las métricas de desempeño.
+   
+    
+    #Entrena el modelo DecisionTreeClassifier y calcula las métricas de desempeño.
 
-    Args:
-        df_historico (pd.DataFrame): Dataset procesado por el pipeline ETL.
-        max_depth (int): Profundidad máxima del árbol para evitar sobreajuste.
-        seed (int): Semilla para partición train/test reproducible.
+   # Args:
+       # df_historico (pd.DataFrame): Dataset procesado por el pipeline ETL.
+      #  max_depth (int): Profundidad máxima del árbol para evitar sobreajuste.
+     #   seed (int): Semilla para partición train/test reproducible.
 
-    Returns:
-        Tuple[DecisionTreeClassifier, Dict[str, Any]]: Modelo entrenado y diccionario de métricas.
-    """
+    
+    #Returns:
+   #     Tuple[DecisionTreeClassifier, Dict[str, Any]]: Modelo entrenado y diccionario de métricas.
+    
     features = ["dia_semana", "es_festivo", "prob_lluvia"]
     X = df_historico[features]
     y = df_historico["categoria_demanda"]
@@ -140,21 +160,21 @@ def predict_scenario(
     consultas_whatsapp: int = 15,
     lead_time_dias: int = 3,
 ) -> Dict[str, Any]:
-    """
-    Evalúa un escenario específico ingresando valores de variables predictoras
-    y genera la recomendación gerencial/operativa correspondiente.
+    
+   # Evalúa un escenario específico ingresando valores de variables predictoras
+    # y genera la recomendación gerencial/operativa correspondiente.
 
-    Args:
-        model (DecisionTreeClassifier): Modelo entrenado.
-        dia_semana (int): Código del día (1=Domingo ... 7=Sábado).
-        es_festivo (int): 1 si es festivo/puente, 0 si es ordinario.
-        prob_lluvia (int): 1 si hay pronóstico de lluvia, 0 si es seco.
-        consultas_whatsapp (int): Volumen de chats sin conversión (demanda latente).
-        lead_time_dias (int): Días de antelación respecto a la fecha objetivo.
+   # Args:
+       # model (DecisionTreeClassifier): Modelo entrenado.
+       # dia_semana (int): Código del día (1=Domingo ... 7=Sábado).
+        #es_festivo (int): 1 si es festivo/puente, 0 si es ordinario.
+       # prob_lluvia (int): 1 si hay pronóstico de lluvia, 0 si es seco.
+      #  consultas_whatsapp (int): Volumen de chats sin conversión (demanda latente).
+     #   lead_time_dias (int): Días de antelación respecto a la fecha objetivo.
 
-    Returns:
-        Dict[str, Any]: Categoría predicha, probabilidades y plan de acción de negocio.
-    """
+   # Returns:
+    #    Dict[str, Any]: Categoría predicha, probabilidades y plan de acción de negocio.
+  
     input_df = pd.DataFrame(
         [[dia_semana, es_festivo, prob_lluvia]],
         columns=["dia_semana", "es_festivo", "prob_lluvia"],
@@ -231,7 +251,7 @@ def predict_scenario(
                 "priorizar paquetes de alto margen ('VIP Picnic') y capturar datos de visitantes "
                 "primerizos para fidelización recurrente."
             )
-
+    
     return {
         "categoria": pred_categoria,
         "rango_esperado": rango_esperado,
