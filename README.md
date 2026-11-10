@@ -1,5 +1,7 @@
 # Dashboard Predictivo y Prescriptivo para el Parque Kyqa Mhuysqa
 
+**Análisis prescriptivo de ventas en las reservas del parque Kyqa Mhuysqa en el municipio de Facatativá.**
+
 Sistema interactivo de Business Analytics desarrollado en Python (**Streamlit**, **Scikit-Learn**, **Plotly** y **SQLAlchemy**) para el Parque Ecoturístico Kyqa Mhuysqa
 
 * **Integrante 1:** Jeison Sanchez Buitrago
