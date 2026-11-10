@@ -210,8 +210,8 @@ df_filtered = df_historico[
 st.markdown(
     """
     <div class="main-header">
-        <h1>🌿 Parque Ecoturístico Kyqa Mhuysqa</h1>
-        <p>Sistema Integrado de Business Analytics para Optimización Operativa y Modelado de Demanda</p>
+        <h1>🌿 Dashboard Parque Ecoturístico Kyqa Mhuysqa</h1>
+        <p>Análisis prescriptivo de ventas en las reservas del parque Kyqa Mhuysqa en el municipio de Facatativá.</p>
     </div>
     """,
     unsafe_allow_html=True,
